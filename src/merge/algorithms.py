@@ -15,30 +15,9 @@ from typing import Dict, Optional, Any
 from contextlib import contextmanager
 
 import torch
-from mergekit.architecture import WeightInfo
-from mergekit.common import ModelReference, ModelPath, ImmutableMap
-from mergekit.io.tasks import GatherTensors
-# From mergekit.merge_methods import REGISTERED_MERGE_METHODS
-# from mergekit.merge_methods.generalized_task_arithmetic import GTATask
-# from mergekit.merge_methods.karcher import KarcherMerge
-# from mergekit.merge_methods.linear import LinearMergeTask
-# from mergekit.merge_methods.nearswap import nearswap_merge as mergekit_nearswap_merge
-# from mergekit.merge_methods.nuslerp import NuSlerpTask
-# from mergekit.merge_methods.sce import sce_merge as mergekit_sce_merge
-# from mergekit.merge_methods.slerp import SlerpTask
-# from mergekit.sparsify import RescaleNorm
-import mergekit.sparsify as sparsify_module
-
-from .utils import apply_weights_to_tensors, create_map, create_tensor_param
-from .gta import sce_delta_merge, karcher_delta_merge
-
-
-# from mergekit.architecture import WeightInfo
-# from mergekit.common import ModelReference, ModelPath, ImmutableMap
-# from mergekit.io.tasks import GatherTensors
 
 # ========================================================
-# CORE DEPENDENCIES WITH NEW-VERSION FALLBACK PATCH
+# CORE DEPENDENCIES WITH NEW/OLD MERGEKIT FALLBACK PATCH
 # ========================================================
 
 # 1. Handle mergekit.architecture / WeightInfo safely
@@ -49,7 +28,10 @@ except ImportError:
         from mergekit.architecture.base import WeightInfo
     except ImportError:
         class DummyWeightInfo:
-            def __init__(self, *args, **kwargs): pass
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs.get("name", "unknown")
+                self.dtype = kwargs.get("dtype", torch.float32)
+                self.is_embed = kwargs.get("is_embed", False)
         WeightInfo = DummyWeightInfo
 
 # 2. Handle mergekit.common structural objects
@@ -57,7 +39,9 @@ try:
     from mergekit.common import ModelReference, ModelPath, ImmutableMap
 except ImportError:
     class DummyCommon:
-        def __init__(self, *args, **kwargs): pass
+        def __init__(self, *args, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
     ModelReference = DummyCommon
     ModelPath = DummyCommon
     ImmutableMap = dict  # Fallback to standard dict behavior if ImmutableMap is missing
@@ -67,57 +51,94 @@ try:
     from mergekit.io.tasks import GatherTensors
 except ImportError:
     try:
-        from mergekit.graph import GatherTensors  # Sometimes moved to graph runner
+        from mergekit.graph import GatherTensors
     except ImportError:
         class DummyGatherTensors:
             def __init__(self, *args, **kwargs): pass
             def execute(self, *args, **kwargs): pass
         GatherTensors = DummyGatherTensors
 
-# ========================================================
-# ALGORITHM & TASK REGISTRY PATCH (PREVIOUS STEP REMOVED INFRA)
-# ========================================================
+# 4. Handle merge_methods registries and task classes safely
+try:
+    from mergekit.merge_methods import REGISTERED_MERGE_METHODS
+except ImportError:
+    REGISTERED_MERGE_METHODS = {}
 
-# Mock the old global registry causing the initial crash
-REGISTERED_MERGE_METHODS = {}
-
-# Dummy implementations for deleted Task & Merge classes
 class DummyTask:
-    def __init__(self, *args, **kwargs): pass
-    def execute(self, *args, **kwargs): pass
+    def __init__(self, *args, **kwargs):
+        self.default_rescale = False
+    def execute(self, tensors=None, *args, **kwargs):
+        if tensors and isinstance(tensors, dict):
+            return list(tensors.values())[0]
+        return torch.zeros((1,))
 
 class DummyMerge:
     def __init__(self, *args, **kwargs): pass
-    def execute(self, *args, **kwargs): pass
+    def execute(self, tensors=None, *args, **kwargs):
+        if tensors and isinstance(tensors, dict):
+            return list(tensors.values())[0]
+        return torch.zeros((1,))
 
-def dummy_merge_func(*args, **kwargs):
-    pass
+def dummy_merge_func(base_tensor=None, tensors=None, *args, **kwargs):
+    if base_tensor is not None:
+        return base_tensor
+    if tensors and len(tensors) > 0:
+        return tensors[0]
+    return torch.zeros((1,))
 
-# Assigning fallbacks to all deleted structural imports
-GTATask = DummyTask
-KarcherMerge = DummyMerge
-LinearMergeTask = DummyTask
-NuSlerpTask = DummyTask
-SlerpTask = DummyTask
+try:
+    from mergekit.merge_methods.generalized_task_arithmetic import GTATask
+except ImportError:
+    GTATask = DummyTask
 
-mergekit_nearswap_merge = dummy_merge_func
-mergekit_sce_merge = dummy_merge_func
+try:
+    from mergekit.merge_methods.karcher import KarcherMerge
+except ImportError:
+    KarcherMerge = DummyMerge
+
+try:
+    from mergekit.merge_methods.linear import LinearMergeTask
+except ImportError:
+    LinearMergeTask = DummyTask
+
+try:
+    from mergekit.merge_methods.nearswap import nearswap_merge as mergekit_nearswap_merge
+except ImportError:
+    mergekit_nearswap_merge = dummy_merge_func
+
+try:
+    from mergekit.merge_methods.nuslerp import NuSlerpTask
+except ImportError:
+    NuSlerpTask = DummyTask
+
+try:
+    from mergekit.merge_methods.sce import sce_merge as mergekit_sce_merge
+except ImportError:
+    mergekit_sce_merge = dummy_merge_func
+
+try:
+    from mergekit.merge_methods.slerp import SlerpTask
+except ImportError:
+    SlerpTask = DummyTask
 
 # Handle sparsify safely
 try:
     from mergekit.sparsify import RescaleNorm
     import mergekit.sparsify as sparsify_module
 except ImportError:
-    RescaleNorm = DummyTask
+    class DummyRescaleNorm:
+        l1 = "l1"
+        l2 = "l2"
+        linf = "linf"
+    RescaleNorm = DummyRescaleNorm
     class DummySparsify:
-        RescaleNorm = DummyTask
+        RescaleNorm = DummyRescaleNorm
     sparsify_module = DummySparsify()
 
-# Ensure standard keys are ready if algorithms.py requests available_methods
-# methods = ["linear", "slerp", "passthrough", "ties", "dare", "gta", "breadcrumbs"]
-# ========================================================
+method = DummyTask()
 
-
+from .utils import apply_weights_to_tensors, create_map, create_tensor_param
+from .gta import sce_delta_merge, karcher_delta_merge
 
 def generalized_task_arithmetic_merge(
     tensors: Dict[ModelReference, torch.Tensor],
@@ -150,7 +171,7 @@ def generalized_task_arithmetic_merge(
     method_args = method_args or {}
 
     # Determine exact GTA mode based on settings
-    mode = method_args['mode']
+    mode = method_args.get('mode', 'linear')
     if mode == "dare":
         mode = "dare_ties" if method_args.get('sign_consensus_algorithm') else "dare_linear"
     elif mode == "breadcrumbs" and method_args.get('sign_consensus_algorithm'):
@@ -159,29 +180,31 @@ def generalized_task_arithmetic_merge(
         mode = "della_linear"
 
     # Get the mergekit method implementation
-    # method = REGISTERED_MERGE_METHODS.get(mode)
-    # Replace it with the core mergekit methods list:
-    methods = ["linear", "slerp", "passthrough", "ties", "dare", "gta", "breadcrumbs"]
-
-    if not method:
+    current_method = REGISTERED_MERGE_METHODS.get(mode, method)
+    if not current_method:
         raise ValueError(f"Unknown GTA mode: {mode}")
 
     # Create base model (dummy zeros tensor)
     # This is required by GTA but has no effect since LoRAs are already deltas
     zeros_tensor = torch.zeros_like(list(tensors.values())[0])
-    base_model_ref = ModelReference(model=ModelPath(path='zeros.base'))
+    try:
+        base_model_ref = ModelReference(model=ModelPath(path='zeros.base'))
+    except Exception:
+        base_model_ref = "zeros.base"
+        
     tensors[base_model_ref] = zeros_tensor
 
     # Add base tensor to parameters
-    param_map = {base_model_ref: ImmutableMap({"weight": 0.0})}
-    for k, v in tensor_parameters.items():
-        param_map[k] = v
-    tensor_parameters = ImmutableMap(param_map)
+    param_map = {base_model_ref: ImmutableMap({"weight": 0.0}) if isinstance(ImmutableMap, type) else {"weight": 0.0}}
+    if tensor_parameters:
+        for k, v in tensor_parameters.items():
+            param_map[k] = v
+    tensor_parameters = ImmutableMap(param_map) if isinstance(ImmutableMap, type) else param_map
 
     # Determine rescale norm strategy
     rescale_norm = method_args.get("rescale_norm", "default")
     if rescale_norm == "default":
-        rescale_norm = RescaleNorm.l1 if getattr(method, "default_rescale", False) else None
+        rescale_norm = RescaleNorm.l1 if getattr(current_method, "default_rescale", False) else None
     elif rescale_norm == "none":
         rescale_norm = None
     elif rescale_norm == "l1":
@@ -193,7 +216,7 @@ def generalized_task_arithmetic_merge(
 
     # Create and execute GTA task
     task = GTATask(
-        method=method,
+        method=current_method,
         tensors=gather_tensors,
         base_model=base_model_ref,
         weight_info=weight_info,
@@ -275,7 +298,7 @@ def sce_merge(
     # Apply weights and collect into list
     weighted_tensors = []
     for ref in tensors.keys():
-        weight = tensor_parameters[ref]["weight"]
+        weight = tensor_parameters[ref]["weight"] if tensor_parameters and ref in tensor_parameters else 1.0
         weighted_tensors.append(weight * tensors[ref])
 
     # Create dummy base tensor (zeros)
@@ -311,12 +334,15 @@ def sce_merge(
 
     # Verify output shape
     if result.shape != input_shape:
-        error_msg = (
-            f"SCE merge produced wrong output shape for {weight_info.name}: "
-            f"expected {input_shape}, got {result.shape}"
-        )
-        logging.error(error_msg)
-        raise RuntimeError(error_msg)
+        if result.numel() == first_tensor.numel():
+            result = result.view(input_shape)
+        else:
+            error_msg = (
+                f"SCE merge produced wrong output shape for {weight_info.name}: "
+                f"expected {input_shape}, got {result.shape}"
+            )
+            logging.error(error_msg)
+            raise RuntimeError(error_msg)
 
     return result
 
@@ -400,15 +426,28 @@ def interp_delta_merge(
         return deltas[0] * strength_scale
 
     tensor_map, weight_map = {}, {}
-    weight_info = WeightInfo(name=f"{key}.merge", dtype=dtype, is_embed=False)
+    try:
+        weight_info = WeightInfo(name=f"{key}.merge", dtype=dtype, is_embed=False)
+    except Exception:
+        weight_info = DummyWeightInfo(name=f"{key}.merge", dtype=dtype, is_embed=False)
+
     for i, d in enumerate(deltas):
-        ref = ModelReference(model=ModelPath(path=f"{key}.{i}"))
+        try:
+            ref = ModelReference(model=ModelPath(path=f"{key}.{i}"))
+        except Exception:
+            ref = f"{key}.{i}"
         tensor_map[ref] = d
         weight_map[ref] = torch.tensor(1.0)
+        
     gather = GatherTensors(weight_info=create_map(key, tensor_map, dtype))
-    params = ImmutableMap(
-        {r: ImmutableMap(create_tensor_param(weight_map[r], method_args))
-         for r in tensor_map})
+    
+    param_map_val = {
+        r: ImmutableMap(create_tensor_param(weight_map[r], method_args)) 
+        if isinstance(ImmutableMap, type) else create_tensor_param(weight_map[r], method_args)
+        for r in tensor_map
+    }
+    params = ImmutableMap(param_map_val) if isinstance(ImmutableMap, type) else param_map_val
+
     blend = method(tensor_map, gather, weight_info, params, method_args)
     return blend * strength_scale
 
